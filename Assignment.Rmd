@@ -1,0 +1,159 @@
+---
+title: "Machine Learning - Prediction Assignment"
+author: "Damien Pond"
+date: "01 October 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Prediction Assignment
+
+One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. The goal of this assignment is to create a prediction model to predict the manner in which particpants did a particular excercise using data gathered from accelerometers on the belt, forearm, arm, and dumbell of 6 participants.
+
+## Data Exploration
+
+Through reading the paper found at <http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf>, it is clear that there is a time dependent aspect to the data, in that measurements of a particular movement were taken at successive points. Despite this, it is unclear which field distinguishes between successive repititions of the excercise. Due to this, each record is thus treated as independent of the others. 
+
+### Setup
+
+```{r}
+set.seed(12345)
+library(corrplot)
+library(caret)
+
+training <- read.csv("pml-training.csv", stringsAsFactors = FALSE)
+testing <- read.csv("pml-testing.csv", stringsAsFactors = FALSE)
+```
+where the .csv files need be located in the current directory.
+
+Here, the testing data is an unseen dataset without a tartget variable, on which we will make predictions. The training data is a set of historic data that has a target variable and is the set on which we will train and validate our model. As a first step, the training data is partitioned into corresponding Training and Testing sets:
+
+```{r}
+inTrain <- createDataPartition(training$classe, p=0.7, list=FALSE)
+Training <- training[inTrain,]
+Testing <- training[-inTrain,]
+```
+
+From viewing the data, it was decided that the first 7 fields were to be removed. The field 'X' is just a row identifier while fields 2-7 were deemed to be participant-specific, and thus not relevant to the experimental outcome. Additionally, it was necessary to remove fields with low variance and those with 'NA' or blank values > 80\% of the total number of records.
+
+```{r}
+Training <- Training[, -(1:7)]
+Testing <- Testing[, -(1:7)]
+
+nzv <- nearZeroVar(Training, saveMetrics=TRUE)
+Training <- Training[,nzv$nzv==FALSE]
+Testing <- Testing[,nzv$nzv==FALSE]
+
+NAColumns <- sapply(Testing, function(x) sum(is.na(x))/length(x) > 0.8)
+Training <- Training[, NAColumns == FALSE]
+Testing <- Testing[, NAColumns == FALSE]
+blankColumns <- sapply(Training, function(x) sum(x=='')/length(x) > 0.8)
+Training <- Training[, blankColumns == FALSE]
+Testing <- Testing[, blankColumns == FALSE]
+dim(Training)
+```
+
+Thus we have reduced the number of fields to `r dim(Training)[2]`
+
+### Correlation
+
+To explore the correlation between the fields, a correlation matrix is generated using the 'corrplot' package:
+
+```{r, fig.width=15,fig.height=15}
+library(corrplot)
+correlationMatrix <- cor(Training[, -ncol(Training)])
+corrplot(correlationMatrix, order = "FPC", method = "color", type = "lower", 
+         tl.cex = 0.8, tl.col = rgb(0, 0, 0))
+```
+
+From the above plot, we see that there indeed exists some correlation between the fields (represented by darker red or blue). It is possible to perform a PCA as a preprocessing step. We will compare model results with and without PCA done.
+
+## Modelling
+
+### Cross Validation
+
+The idea behind cross validation is get an idea of how the model may behave on an out-of-sample dataset. By default, the train function from the 'caret' package uses bootstrapping. Here, we will use 10-fold cross validation by defining:
+
+```{r}
+CV <- trainControl(method="cv", number=10)
+```
+
+### Principal Component Analysis (PCA)
+```{r}
+pca <- preProcess(Training[,-ncol(Training)], method = c("pca", "center", "scale") )
+pca
+```
+Note that we had to remove the target variable.
+As can be seen, only `r ncol(pca$rotation)` components are needed to explain 95% of the variance in the data. We use these components to predict on the training set, which thus becomes the new dataset from which to build the model
+
+### Building the Model
+
+Before selecting a model, various methods will be tested and compared, both on the PCA and non-PCA datasets. Due to memory concerns, each of the models are built individually and the out of sample accuracy will be reported. 
+
+As an example, a simple decision tree is demonstrated below:
+
+#### Decision Tree (non-PCA)
+```{r}
+set.seed(12345)
+model <- train(classe ~ ., data = Training, method = "rpart", trControl = CV)
+model
+```
+From the model output, we see that 10-fold cross-validation was performed. Over the 10 resamples, the accuracy was given by:
+    
+```{r}
+model$resample
+```
+With a mean in-sample accuracy of `r mean(model$resample$Accuracy)`, which gives a good indication of the expected out of sample error rate, which should approximately be 1 - `r mean(model$resample$Accuracy)` = `r 1 - mean(model$resample$Accuracy)`.
+
+To include the principal components that were generated, the model is built as follows:
+
+#### Decision Tree (PCA)
+```{r}
+set.seed(12345)
+PCApredict <- data.frame(predict(pca, Training))
+PCApredict$classe <- Training$classe
+modelPCA <- train(classe ~ ., data = PCApredict, method = "rpart", trControl = CV)
+```
+With a mean in sample accuracy of `r mean(modelPCA$resample$Accuracy)`.
+
+We thus apply these to the Testing data:
+```{r}
+set.seed(12345)
+pred <- predict(model, Testing)
+predPCATest <- predict(pca, Testing)
+predPCA <- predict(modelPCA, predPCATest)
+```
+Thus the model accuracy on the data is as follows:
+
+* Decision Tree, no PCA - `r confusionMatrix(pred, Testing$classe)$overall[1]`
+* Decision Tree, PCA - `r confusionMatrix(predPCA, Testing$classe)$overall[1]`
+
+This process is thus subsequently repeated for several models by changing the "method" argument in the "train" function as follows:
+
+| Model       | Method          | 
+| ------------|:-------------:| 
+| Decision Tree | rpart |
+| Generalised Boosted Regression | gbm |
+| Random Forest | rf |
+
+## Results
+
+| Model       | Accuracy - non-PCA      | Accuracy - PCA |
+| ------------|:-------------:| :----------------:|
+| Decision Tree | 0.4963466 | 0.384367 |
+| Generalised Boosted Regression | 0.9558199  | 0.8219201  |
+| Random Forest | 0.988955  | 0.9731521  |
+
+From the above, it is clear the the PCA reduces the accuracy. Furthermore, the random forest algorithm is a clear winner.
+
+## Testing data
+
+With the winning model, we now predict on the 'testing' set provided:
+
+```{r}
+model <- train(classe ~ ., data = Training, method = "rf", trControl = CV)
+predict(model, testing[,-c(1:7)])
+```
